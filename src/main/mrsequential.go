@@ -6,13 +6,16 @@ package main
 // go run mrsequential.go wc.so pg*.txt
 //
 
-import "fmt"
-import "6.5840/mr"
-import "plugin"
-import "os"
-import "log"
-import "io/ioutil"
-import "sort"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"plugin"
+	"sort"
+
+	"6.5840/mr"
+)
 
 // for sorting by key.
 type ByKey []mr.KeyValue
@@ -27,9 +30,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
 		os.Exit(1)
 	}
+	println(os.Args[1])
 
 	mapf, reducef := loadPlugin(os.Args[1])
-
 	//
 	// read each input file,
 	// pass it to Map,
@@ -75,8 +78,9 @@ func main() {
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
-		output := reducef(intermediate[i].Key, values)
 
+		output := reducef(intermediate[i].Key, values)
+		print(intermediate[i].Key, values)
 		// this is the correct format for each line of Reduce output.
 		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 
