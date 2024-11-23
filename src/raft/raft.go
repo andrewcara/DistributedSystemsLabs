@@ -112,12 +112,35 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-func (rf *Raft) convertToCandidate() {
-	rf.state = CANDIDATE
-	rf.currentTerm++
-	rf.votedFor = rf.me
-	rf.lastReceived = time.Now()
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
 
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PreLogTerm   int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 // save Raft's persistent state to stable storage,
@@ -167,55 +190,108 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int
-	PreLogTerm   int
-	Entries      []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
 // example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election. even if the Raft instance has been killed,
+// this function should return gracefully.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	index := -1
+	term := -1
+	isLeader := true
+
+	// Your code here (2B).
+
+	return index, term, isLeader
+}
+
+// the tester doesn't halt goroutines created by Raft after each test,
+// but it does call the Kill() method. your code can use killed() to
+// check whether Kill() has been called. the use of atomic avoids the
+// need for a lock.
+//
+// the issue is that long-running goroutines use memory and may chew
+// up CPU time, perhaps causing later tests to fail and generating
+// confusing debug output. any goroutine with a long-running loop
+// should call killed() to check whether it should stop.
+func (rf *Raft) Kill() {
+	atomic.StoreInt32(&rf.dead, 1)
 	rf.mu.Lock()
+	rf.state = DEAD
+	rf.mu.Unlock()
+	// Your code here, if desired.
+}
 
-	DPrintf("Current candidate terms %d Current voter terms %d", args.CandidateId, rf.me)
+func (rf *Raft) killed() bool {
+	z := atomic.LoadInt32(&rf.dead)
+	return z == 1
+}
 
-	if args.Term < rf.currentTerm || rf.votedFor != -1 {
+// handler for append entries
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term >= rf.currentTerm {
+		rf.lastReceived = time.Now()
+		rf.state = FOLLOWER
+		// reply.Term = rf.currentTerm
+		// reply.Success = true
+	}
+
+}
+
+// rpc call for append entries
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) leaderPulse() {
+	rf.mu.Lock()
+	args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.getLastLogEntry().Index, rf.getLastLogEntry().Term, rf.log, 1}
+	reply := AppendEntriesReply{}
+	rf.mu.Unlock()
+
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+		//DPrintf("server id  %d candidate it %d ", index, rf.me)
+		go func(index int) {
+			ok := rf.sendAppendEntries(index, &args, &reply)
+
+			if !ok {
+				return
+			}
+		}(index)
+	}
+}
+
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+
+	//DPrintf("Current candidate terms %d Current voter terms %d candidateid %d voter id %d", args.Term, rf.currentTerm, args.CandidateId, rf.currentTerm)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = args.CandidateId
 		return
 	}
 	rf.votedFor = args.CandidateId
-	rf.currentTerm++
+	rf.currentTerm = args.Term
 	reply.VoteGranted = true
 	rf.state = FOLLOWER
 	rf.lastReceived = time.Now()
-
-	rf.mu.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -251,82 +327,81 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
-}
-
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
-func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-
-	rf.state = DEAD
-	// Your code here, if desired.
-}
-
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
-}
-
-// handler for append entries
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-
+func (rf *Raft) convertToCandidate() {
+	rf.state = CANDIDATE
+	rf.currentTerm++
+	rf.votedFor = rf.me
 	rf.lastReceived = time.Now()
-	rf.state = FOLLOWER
 
-	rf.mu.Unlock()
 }
 
-// rpc call for append entries
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-func (rf *Raft) leaderPulse() {
+func (rf *Raft) kickoffelection() {
 	rf.mu.Lock()
-	args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.getLastLogEntry().Index, rf.getLastLogEntry().Term, rf.log, 1}
-	reply := AppendEntriesReply{}
+	// Capture all needed state while holding the lock
+	currentTerm := rf.currentTerm + 1
+	lastLogEntry := rf.getLastLogEntry()
+	args := RequestVoteArgs{
+		Term:         currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogEntry.Index,
+		LastLogTerm:  lastLogEntry.Term,
+	}
+
+	// Update state atomically
+	rf.currentTerm = currentTerm
+	rf.state = CANDIDATE
+	rf.votedFor = rf.me
+	rf.lastReceived = time.Now()
 	rf.mu.Unlock()
-	for index, _ := range rf.peers {
-		if index == rf.me {
+
+	// Track votes with its own mutex to avoid holding the main lock
+	var votesMu sync.Mutex
+	votes := 1
+	done := false
+
+	var wg sync.WaitGroup
+	for i := range rf.peers {
+		if i == rf.me {
 			continue
 		}
-		//DPrintf("server id  %d candidate it %d ", index, rf.me)
-		go func(index int) {
-			ok := rf.sendAppendEntries(index, &args, &reply)
 
-			if !ok {
+		wg.Add(1)
+		go func(peerIndex int) {
+			defer wg.Done()
+			reply := RequestVoteReply{}
+
+			if ok := rf.sendRequestVote(peerIndex, &args, &reply); !ok {
 				return
 			}
-		}(index)
+
+			if !reply.VoteGranted {
+				return
+			}
+
+			votesMu.Lock()
+			defer votesMu.Unlock()
+
+			if done {
+				return
+			}
+
+			votes++
+			if votes > len(rf.peers)/2 {
+				rf.mu.Lock()
+				if rf.currentTerm == currentTerm && rf.state == CANDIDATE {
+					rf.state = LEADER
+					// Initialize leader state
+					rf.nextIndex = make([]int, len(rf.peers))
+					rf.matchIndex = make([]int, len(rf.peers))
+					for i := range rf.peers {
+						rf.nextIndex[i] = rf.getLastLogEntry().Index + 1
+						rf.matchIndex[i] = 0
+					}
+				}
+				rf.mu.Unlock()
+				done = true
+			}
+		}(i)
 	}
 }
 
@@ -356,11 +431,6 @@ func (rf *Raft) ticker() {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 
 			rf.mu.Lock()
-
-			// if rf.state == DEAD {
-			// 	rf.mu.Unlock()
-			// 	return
-			// }
 			//DPrintf("%s with id %d and current term%d %v number of peers%d", string(rf.state), rf.me, rf.currentTerm, rf.lastReceived, len(rf.peers))
 			if rf.lastReceived.Before(startTime) {
 				if rf.state != LEADER {
@@ -371,51 +441,6 @@ func (rf *Raft) ticker() {
 
 		}
 	}
-}
-
-func (rf *Raft) kickoffelection() {
-	rf.mu.Lock()
-	rf.lastReceived = time.Now()
-	lastLogEntry := rf.getLastLogEntry()
-	args := RequestVoteArgs{rf.currentTerm, rf.me, lastLogEntry.Index, lastLogEntry.Term}
-	rf.convertToCandidate()
-	term := rf.currentTerm
-	votes := 1
-	done := false
-	reply := RequestVoteReply{}
-	rf.mu.Unlock()
-	for index, _ := range rf.peers {
-		if index == rf.me {
-			continue
-		}
-		// DPrintf("server id  %d candidate it %d ", index, rf.me)
-		go func(index int) {
-			ok := rf.sendRequestVote(index, &args, &reply)
-
-			if !ok {
-				return
-			}
-
-			if !reply.VoteGranted {
-				return
-			}
-
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			votes++
-
-			if done || votes < len(rf.peers)/2 {
-				return
-			}
-
-			if rf.state != CANDIDATE || term != rf.currentTerm {
-				return
-			}
-			done = true
-			rf.state = LEADER
-		}(index)
-	}
-
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -436,7 +461,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = FOLLOWER
-	rf.currentTerm = 0
+	rf.currentTerm = 1
 	rf.votedFor = -1
 	rf.lastReceived = time.Now()
 	rf.log = append(rf.log, LogEntry{0, rf.currentTerm})
