@@ -57,6 +57,12 @@ type LogEntry struct {
 type Status string
 
 const (
+	HeartbeatInterval   = 50 * time.Millisecond // Should be well under election timeout
+	BaseElectionTimeout = 700 * time.Millisecond
+	ElectionRandomRange = 150 * time.Millisecond // Results in 300-450ms timeout
+)
+
+const (
 	FOLLOWER  Status = "FOLLOWER"
 	CANDIDATE Status = "CANDIDATE"
 	LEADER    Status = "LEADER"
@@ -240,10 +246,13 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// DPrintf("Raft Term %d Raft ID %d last received %v", rf.currentTerm, rf.me, rf.lastReceived)
 
 	if args.Term >= rf.currentTerm {
 		rf.lastReceived = time.Now()
 		rf.state = FOLLOWER
+		rf.currentTerm = args.Term
+		// DPrintf("Raft Term %d Raft ID %d last received %v", rf.currentTerm, rf.me, rf.lastReceived)
 		// reply.Term = rf.currentTerm
 		// reply.Success = true
 	}
@@ -257,36 +266,62 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) leaderPulse() {
-	rf.mu.Lock()
-	args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.getLastLogEntry().Index, rf.getLastLogEntry().Term, rf.log, 1}
-	reply := AppendEntriesReply{}
-	rf.mu.Unlock()
-
-	for index := range rf.peers {
-		if index == rf.me {
-			continue
+	// Keep sending heartbeats while we're leader
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state != LEADER {
+			rf.mu.Unlock()
+			return
 		}
-		//DPrintf("server id  %d candidate it %d ", index, rf.me)
-		go func(index int) {
-			ok := rf.sendAppendEntries(index, &args, &reply)
 
-			if !ok {
-				return
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderID:     rf.me,
+			PrevLogIndex: rf.getLastLogEntry().Index,
+			PreLogTerm:   rf.getLastLogEntry().Term,
+			Entries:      rf.log,
+			LeaderCommit: rf.commitedIndex,
+		}
+		rf.mu.Unlock()
+
+		// Send AppendEntries to all peers
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
 			}
-		}(index)
+			go func(peer int) {
+				reply := AppendEntriesReply{}
+				if ok := rf.sendAppendEntries(peer, &args, &reply); ok {
+					//DPrintf("%v", time.Now())
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.state = FOLLOWER
+						rf.votedFor = -1
+						return
+					}
+				}
+			}(i)
+		}
+		// Wait for the heartbeat interval before next round
+		time.Sleep(HeartbeatInterval)
 	}
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
-	//DPrintf("Current candidate terms %d Current voter terms %d candidateid %d voter id %d", args.Term, rf.currentTerm, args.CandidateId, rf.currentTerm)
 	rf.mu.Lock()
+	// DPrintf("Current candidate terms %d Current voter terms %d candidateid %d voter id %d last received %v", args.Term, rf.currentTerm, args.CandidateId, rf.me, rf.lastReceived)
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = args.CandidateId
 		return
 	}
+
+	//TO-DO implement logic for handling a candidates log so that it is at least as up to date with the server
 	rf.votedFor = args.CandidateId
 	rf.currentTerm = args.Term
 	reply.VoteGranted = true
@@ -346,18 +381,13 @@ func (rf *Raft) kickoffelection() {
 		LastLogIndex: lastLogEntry.Index,
 		LastLogTerm:  lastLogEntry.Term,
 	}
-
 	// Update state atomically
-	rf.currentTerm = currentTerm
-	rf.state = CANDIDATE
-	rf.votedFor = rf.me
-	rf.lastReceived = time.Now()
+	rf.convertToCandidate()
 	rf.mu.Unlock()
 
 	// Track votes with its own mutex to avoid holding the main lock
 	var votesMu sync.Mutex
 	votes := 1
-	done := false
 
 	var wg sync.WaitGroup
 	for i := range rf.peers {
@@ -381,12 +411,9 @@ func (rf *Raft) kickoffelection() {
 			votesMu.Lock()
 			defer votesMu.Unlock()
 
-			if done {
-				return
-			}
-
 			votes++
 			if votes > len(rf.peers)/2 {
+				// DPrintf("voting finished")
 				rf.mu.Lock()
 				if rf.currentTerm == currentTerm && rf.state == CANDIDATE {
 					rf.state = LEADER
@@ -394,51 +421,48 @@ func (rf *Raft) kickoffelection() {
 					rf.nextIndex = make([]int, len(rf.peers))
 					rf.matchIndex = make([]int, len(rf.peers))
 					for i := range rf.peers {
+
 						rf.nextIndex[i] = rf.getLastLogEntry().Index + 1
 						rf.matchIndex[i] = 0
 					}
 				}
 				rf.mu.Unlock()
-				done = true
+				// DPrintf("leader pulse sent")
+				go rf.leaderPulse()
+				return
 			}
 		}(i)
 	}
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
-		// Your code here (2A)
-		// Check if a leader election should be started.
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-
-		if rf.state == DEAD {
+		if state == DEAD {
 			return
 		}
-
-		if rf.state == LEADER {
-
-			ms := 105
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			rf.leaderPulse()
-
+		if state == LEADER {
+			// Start the leader pulse if we aren't already running it
+			//go rf.leaderPulse()
+			// Sleep for a while before checking again
+			time.Sleep(HeartbeatInterval)
 		} else {
+			// Election timeout logic remains the same
+			electionTimeout := BaseElectionTimeout +
+				time.Duration(rand.Int63())%ElectionRandomRange
 
 			startTime := time.Now()
-			ms := 200 + (rand.Int63() % 300)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
+			time.Sleep(electionTimeout)
 
 			rf.mu.Lock()
-			//DPrintf("%s with id %d and current term%d %v number of peers%d", string(rf.state), rf.me, rf.currentTerm, rf.lastReceived, len(rf.peers))
-			if rf.lastReceived.Before(startTime) {
-				if rf.state != LEADER {
-					go rf.kickoffelection()
-				}
+			if rf.lastReceived.Before(startTime) && rf.state != LEADER {
+				go rf.kickoffelection()
 			}
 			rf.mu.Unlock()
-
 		}
 	}
 }
